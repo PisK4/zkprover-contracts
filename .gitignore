@@ -6,6 +6,7 @@ typechain
 typechain-types
 /.yarn
 .*.txt
+yarn.lock
 
 # Hardhat files
 cache

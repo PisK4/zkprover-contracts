@@ -16,8 +16,15 @@ import "./interfaces/IVerifier.sol";
 import "./StakeManager.sol";
 import "./SenderCreator.sol";
 import "./WorldStateManager.sol";
+import "./ERC20StakeManager.sol";
+import "./Helpers.sol";
 
-contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
+contract EntryPoint is
+    IEntryPoint,
+    StakeManager,
+    WorldStateManager,
+    ERC20StakeManager
+{
     using UserOperationLib for UserOperation;
 
     SenderCreator private immutable senderCreator = new SenderCreator();
@@ -33,7 +40,9 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
 
     IVerifier public immutable verifier;
 
-    constructor(IVerifier _verifier) {
+    event PreBatchTxGas(address[] indexed senders, uint256[] indexed actualGas);
+
+    constructor(IVerifier _verifier) ERC20StakeManager(msg.sender) {
         verifier = _verifier;
     }
 
@@ -51,12 +60,11 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
     function _fugalExecuteUserOp(
         uint256 opIndex,
         UserOperation calldata userOp
-    ) private returns (uint256 actualGas) {
-        uint256 preGas = gasleft();
-
+    ) private {
         bytes memory callData = userOp.callData;
         address sender = userOp.sender;
         uint256 callGasLimit = userOp.callGasLimit;
+        (opIndex);
 
         if (callData.length > 0) {
             (bool success, bytes memory result) = address(sender).call{
@@ -73,8 +81,6 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
                 }
             }
         }
-
-        uint256 actualGas = preGas - gasleft();
     }
 
     /**
@@ -137,17 +143,86 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
         uint256[1] calldata pubSignals,
         address payable beneficiary
     ) public {
+        (beneficiary);
         // Check proof
-
+        // TODO: just for testing, will modify later
         verifier.verify(pubSignals, proof);
+        require(
+            calculateUserOpHashesSum(ops) !=
+                0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef,
+            "AA12 invalid ops hash sum"
+        );
 
         uint256 opslen = ops.length;
+        uint256[] memory actualGas = new uint256[](opslen);
+        address[] memory senders = new address[](opslen);
 
         unchecked {
-            uint256 actualGas = 0;
-
             for (uint256 i = 0; i < opslen; i++) {
-                actualGas += _fugalExecuteUserOp(i, ops[i]);
+                uint256 executedGas = gasleft();
+                if (ops[i].initCode.length != 0) {
+                    _createSenderIfNeeded(i, ops[i]);
+                }
+                _fugalExecuteUserOp(i, ops[i]);
+                (actualGas[i], senders[i]) = executeWithPaymaster(
+                    ops[i],
+                    executedGas - gasleft()
+                );
+            }
+            _preBatchTxGasTicket = keccak256(abi.encode(senders, actualGas));
+            emit PreBatchTxGas(senders, actualGas);
+
+            // TODO: args just for testing, will modify later
+            transferStateRoot(
+                keccak256(abi.encode(block.timestamp)),
+                keccak256(abi.encode(msg.sender))
+            );
+        }
+    }
+
+    function executeWithPaymaster(
+        UserOperation calldata ops,
+        uint256 executedGas
+    ) internal returns (uint256 actualGas, address senders) {
+        uint256 preGas = gasleft();
+        unchecked {
+            if (ops.paymasterAndData.length >= 20) {
+                uint256 exchangeRate;
+                uint256 deposit;
+                address paymaster = address(bytes20(ops.paymasterAndData[:20]));
+                address erc20Token;
+                senders = address(0);
+                (erc20Token, exchangeRate) = decodePaymasterData(
+                    ops.paymasterAndData
+                );
+                if (exchangeRate == 0) {
+                    deposit = deposits[paymaster].deposit;
+                }
+                uint256 requiredPrefund = min(
+                    ops.maxFeePerGas,
+                    ops.maxPriorityFeePerGas
+                );
+                actualGas = executedGas + (preGas - gasleft());
+                requiredPrefund *= actualGas;
+                if (exchangeRate == 0) {
+                    require(
+                        deposit >= requiredPrefund,
+                        "AA31 paymaster deposit too low"
+                    );
+                    deposits[paymaster].deposit = uint112(
+                        deposit - requiredPrefund
+                    );
+                } else {
+                    payGasFeeERC20(
+                        paymaster,
+                        erc20Token,
+                        exchangeRate,
+                        actualGas
+                    );
+                }
+            } else {
+                senders = ops.sender;
+                actualGas = executedGas + (preGas - gasleft());
             }
         }
     }
@@ -286,9 +361,10 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
     function simulateValidation(UserOperation calldata userOp) external {
         UserOpInfo memory outOpInfo;
 
+        _simulationOnlyValidations(userOp);
         (
-            uint256 sigTimeRange,
-            uint256 paymasterTimeRange
+            uint256 validationData,
+            uint256 paymasterValidationData
         ) = _validatePrepayment(0, userOp, outOpInfo);
         StakeInfo memory paymasterInfo = getStakeInfo(
             outOpInfo.mUserOp.paymaster
@@ -303,17 +379,18 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
             factoryInfo = getStakeInfo(factory);
         }
 
-        (
-            bool sigFailed,
-            uint64 validAfter,
-            uint64 validUntil
-        ) = _intersectTimeRange(sigTimeRange, paymasterTimeRange);
+        ValidationData memory data = _intersectvalidationData(
+            validationData,
+            paymasterValidationData
+        );
+        address aggregator = data.aggregator;
+        bool sigFailed = aggregator == address(1);
         ReturnInfo memory returnInfo = ReturnInfo(
             outOpInfo.preOpGas,
             outOpInfo.prefund,
             sigFailed,
-            validAfter,
-            validUntil,
+            data.validAfter,
+            data.validUntil,
             getMemoryBytesFromOffset(outOpInfo.contextOffset)
         );
 
@@ -387,6 +464,48 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
         }
     }
 
+    function _createSenderIfNeeded(
+        uint256 opIndex,
+        UserOperation calldata op
+    ) internal {
+        if (op.initCode.length != 0) {
+            address sender = op.sender;
+            if (sender.code.length != 0)
+                revert FailedOp(
+                    opIndex,
+                    address(0),
+                    "AA10 sender already constructed"
+                );
+            address sender1 = senderCreator.createSender{
+                gas: op.verificationGasLimit
+            }(op.initCode);
+            if (sender1 == address(0))
+                revert FailedOp(
+                    opIndex,
+                    address(0),
+                    "AA13 initCode failed or OOG"
+                );
+            if (sender1 != sender)
+                revert FailedOp(
+                    opIndex,
+                    address(0),
+                    "AA14 initCode must return sender"
+                );
+            if (sender1.code.length == 0)
+                revert FailedOp(
+                    opIndex,
+                    address(0),
+                    "AA15 initCode must create sender"
+                );
+
+            address factory = address(bytes20(op.initCode[:20]));
+            address paymaster = op.paymasterAndData.length >= 20
+                ? address(bytes20(op.paymasterAndData[:20]))
+                : address(0);
+            emit AccountDeployed(0, sender, factory, paymaster);
+        }
+    }
+
     /**
      * Get counterfactual sender address.
      *  Calculate the sender contract address that will be generated by the initCode and salt in the UserOperation.
@@ -395,6 +514,47 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
      */
     function getSenderAddress(bytes calldata initCode) public {
         revert SenderAddressResult(senderCreator.createSender(initCode));
+    }
+
+    function _simulationOnlyValidations(
+        UserOperation calldata userOp
+    ) internal view {
+        // solhint-disable-next-line no-empty-blocks
+        try
+            this._validateSenderAndPaymaster(
+                userOp.initCode,
+                userOp.sender,
+                userOp.paymasterAndData
+            )
+        {} catch Error(string memory revertReason) {
+            if (bytes(revertReason).length != 0) {
+                revert FailedOp(0, userOp.sender, revertReason);
+            }
+        }
+    }
+
+    /**
+     * Called only during simulation.
+     * This function always reverts to prevent warm/cold storage differentiation in simulation vs execution.
+     */
+    function _validateSenderAndPaymaster(
+        bytes calldata initCode,
+        address sender,
+        bytes calldata paymasterAndData
+    ) external view {
+        if (initCode.length == 0 && sender.code.length == 0) {
+            // it would revert anyway. but give a meaningful message
+            revert("AA20 account not deployed");
+        }
+        if (paymasterAndData.length >= 20) {
+            address paymaster = address(bytes20(paymasterAndData[0:20]));
+            if (paymaster.code.length == 0) {
+                // it would revert anyway. but give a meaningful message
+                revert("AA30 paymaster not deployed");
+            }
+        }
+        // always revert
+        revert("");
     }
 
     /**
@@ -419,6 +579,7 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
             MemoryUserOp memory mUserOp = opInfo.mUserOp;
             address sender = mUserOp.sender;
             _createSenderIfNeeded(opIndex, opInfo, op.initCode);
+            numberMarker();
             uint256 missingAccountFunds = 0;
             address paymaster = mUserOp.paymaster;
             if (paymaster == address(0)) {
@@ -427,17 +588,18 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
                     ? 0
                     : requiredPrefund - bal;
             }
-            try
-                IAccount(sender).validateUserOp{
-                    gas: mUserOp.verificationGasLimit
-                }(op, missingAccountFunds)
-            returns (uint256 _sigTimeRange) {
-                sigTimeRange = _sigTimeRange;
-            } catch Error(string memory revertReason) {
-                revert FailedOp(opIndex, address(0), revertReason);
-            } catch {
-                revert FailedOp(opIndex, address(0), "AA23 reverted (or OOG)");
-            }
+            sigTimeRange = 0;
+            // try
+            //     IAccount(sender).validateUserOp{
+            //         gas: mUserOp.verificationGasLimit
+            //     }(op, missingAccountFunds)
+            // returns (uint256 _sigTimeRange) {
+            //     sigTimeRange = _sigTimeRange;
+            // } catch Error(string memory revertReason) {
+            //     revert FailedOp(opIndex, address(0), revertReason);
+            // } catch {
+            //     revert FailedOp(opIndex, address(0), "AA23 reverted (or OOG)");
+            // }
             if (paymaster == address(0)) {
                 DepositInfo storage senderInfo = deposits[sender];
                 uint256 deposit = senderInfo.deposit;
@@ -467,7 +629,7 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
         UserOpInfo memory opInfo,
         uint256 requiredPreFund,
         uint256 gasUsedByValidateAccountPrepayment
-    ) internal returns (bytes memory context, uint256 sigTimeRange) {
+    ) internal returns (bytes memory context, uint256 validationData) {
         unchecked {
             MemoryUserOp memory mUserOp = opInfo.mUserOp;
             uint256 verificationGasLimit = mUserOp.verificationGasLimit;
@@ -495,11 +657,15 @@ contract EntryPoint is IEntryPoint, StakeManager, WorldStateManager {
                     opInfo.userOpHash,
                     requiredPreFund
                 )
-            returns (bytes memory _context, uint256 _sigTimeRange) {
+            returns (bytes memory _context, uint256 _validationData) {
                 context = _context;
-                sigTimeRange = _sigTimeRange;
+                validationData = _validationData;
             } catch Error(string memory revertReason) {
-                revert FailedOp(opIndex, paymaster, revertReason);
+                revert FailedOp(
+                    opIndex,
+                    paymaster,
+                    string.concat("AA33 reverted: ", revertReason)
+                );
             } catch {
                 revert FailedOp(opIndex, paymaster, "AA33 reverted (or OOG)");
             }

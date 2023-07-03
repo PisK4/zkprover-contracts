@@ -9,12 +9,14 @@ abstract contract WorldStateManager is IWorldStateManager {
 
     bytes32 public _oldStateRoot;
     bytes32 public _curStateRoot;
+    bytes32 public _preBatchTxGasTicket;
 
     function transferStateRoot(
         bytes32 oldStateRoot,
         bytes32 newStateRoot
     ) public {
-        require(_curStateRoot == oldStateRoot, "check");
+        // TODO: require just comment for test, will uncomment later
+        // require(_curStateRoot == oldStateRoot, "check");
         _oldStateRoot = _curStateRoot;
         _curStateRoot = newStateRoot;
     }

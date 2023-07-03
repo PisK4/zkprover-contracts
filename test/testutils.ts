@@ -5,10 +5,11 @@ import {
   BigNumberish,
   Contract,
   ContractReceipt,
+  PopulatedTransaction,
   Signer,
   Wallet,
 } from "ethers";
-import { arrayify, hexConcat, keccak256, parseEther } from "ethers/lib/utils";
+import { arrayify, defaultAbiCoder, hexConcat, keccak256, parseEther } from "ethers/lib/utils";
 import { ethers } from "hardhat";
 import {
   Account,
@@ -17,13 +18,22 @@ import {
   Account__factory,
   EntryPoint,
   IERC20,
+  TestToken,
+  VerifyingPaymaster,
+  VerifyingPaymaster__factory,
 } from "../typechain-types";
+import { fillAndSign } from "./UserOp";
+import { UserOperationStruct } from "../typechain-types/contracts/Account";
+import { debugTransaction } from "./debugTx";
 
 export const AddressZero = ethers.constants.AddressZero;
 export const HashZero = ethers.constants.HashZero;
 export const ONE_ETH = parseEther("1");
 export const TWO_ETH = parseEther("2");
 export const FIVE_ETH = parseEther("5");
+export const MOCK_VALID_UNTIL = '0x00000000deadbeef'
+export const MOCK_VALID_AFTER = '0x0000000000001234'
+export const MOCK_SIG = '0x1234'
 
 export const tostr = (x: any): string => (x != null ? x.toString() : "null");
 
@@ -252,6 +262,33 @@ export function objdump(obj: { [key: string]: any }): any {
     );
 }
 
+export async function checkForBannedOps (txHash: string, checkPaymaster: boolean): Promise<void> {
+  const tx = await debugTransaction(txHash)
+  const logs = tx.structLogs
+  const blockHash = logs.map((op, index) => ({ op: op.op, index })).filter(op => op.op === 'NUMBER')
+  expect(blockHash.length).to.equal(2, 'expected exactly 2 call to NUMBER (Just before and after validateUserOperation)')
+  const validateAccountOps = logs.slice(0, blockHash[0].index - 1)
+  const validatePaymasterOps = logs.slice(blockHash[0].index + 1)
+  const ops = validateAccountOps.filter(log => log.depth > 1).map(log => log.op)
+  const paymasterOps = validatePaymasterOps.filter(log => log.depth > 1).map(log => log.op)
+
+  expect(ops).to.include('POP', 'not a valid ops list: ' + JSON.stringify(ops)) // sanity
+  const bannedOpCodes = new Set(['GAS', 'BASEFEE', 'GASPRICE', 'NUMBER'])
+  expect(ops.filter((op, index) => {
+    // don't ban "GAS" op followed by "*CALL"
+    if (op === 'GAS' && (ops[index + 1].match(/CALL/) != null)) {
+      return false
+    }
+    return bannedOpCodes.has(op)
+  })).to.eql([])
+  if (checkPaymaster) {
+    expect(paymasterOps).to.include('POP', 'not a valid ops list: ' + JSON.stringify(paymasterOps)) // sanity
+    expect(paymasterOps).to.not.include('BASEFEE')
+    expect(paymasterOps).to.not.include('GASPRICE')
+    expect(paymasterOps).to.not.include('NUMBER')
+  }
+}
+
 /**
  * process exception of ValidationResult
  * usage: entryPoint.simulationResult(..).catch(simulationResultCatch)
@@ -272,11 +309,6 @@ export function simulationResultWithAggregationCatch(e: any): any {
     throw e;
   }
   return e.errorArgs;
-}
-
-export async function isDeployed(addr: string): Promise<boolean> {
-  const code = await ethers.provider.getCode(addr);
-  return code.length > 2;
 }
 
 // Deploys an implementation and a proxy pointing to this implementation
@@ -308,4 +340,110 @@ export function sleep(ms: number) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+export async function generateBatchofERC20TransferOp(
+	signer: Signer,
+	token: TestToken,
+	entryPoint: any,
+	adminAccount: Account,
+	testLoop: number,
+	paymaster?: VerifyingPaymaster,
+	offchainSinger?: Signer,
+	oldAccount?: Wallet,
+	oldAccountFactory?: AccountFactory,
+	testwithoutFund?: boolean
+) {
+	let erc20TransfercallData: PopulatedTransaction
+	let account: Account
+	let accountFactory: AccountFactory
+	let paymasterAndDataTmp: BytesLike
+	let op: UserOperationStruct
+	//const signer = ethers.provider.getSigner()
+	const accountOwner = oldAccount ?? createAccountOwner()
+
+	const transfercallData = await token.populateTransaction.transfer(
+		accountOwner.address,
+		100 * (testLoop + 1)
+	)
+
+	erc20TransfercallData = await adminAccount.populateTransaction.execute(
+		token.address,
+		0,
+		transfercallData.data!
+	)
+	;({ proxy: account, accountFactory: accountFactory } = await createAccount(
+		signer,
+		await accountOwner.getAddress(),
+		entryPoint.address,
+		oldAccountFactory
+	))
+
+	if (!testwithoutFund) {
+		await fund(account.address)
+		await account.addDeposit({ value: ethers.utils.parseEther('1') })
+	}
+	await token.mint(account.address, 100000)
+	//console.log('account deployed to:', account.address)
+
+	if (paymaster) {
+
+		const userOp1 = await fillAndSign(
+			{
+				callData: erc20TransfercallData.data,
+				sender: account.address,
+				callGasLimit: 2e6,
+				verificationGasLimit: 2e6
+			},
+			accountOwner,
+			entryPoint
+		)
+
+		const hash = await paymaster.getHash(
+			userOp1,
+			MOCK_VALID_UNTIL,
+			MOCK_VALID_AFTER,
+      token.address,
+			0
+		)
+
+		let sig: BytesLike
+
+		if (offchainSinger) {
+			sig = await offchainSinger.signMessage(arrayify(hash))
+		} else {
+			sig = MOCK_SIG
+		}
+		op = await fillAndSign(
+			{
+				...userOp1,
+				paymasterAndData: hexConcat([
+					paymaster.address,
+					defaultAbiCoder.encode(
+						['uint48', 'uint48', 'address', 'uint256'],
+						[MOCK_VALID_UNTIL, MOCK_VALID_AFTER, token.address, 0]
+					),
+					sig
+				])
+			},
+			accountOwner,
+			entryPoint
+		)
+	} else {
+		await fund(account.address)
+		await account.addDeposit({ value: ethers.utils.parseEther('1') })
+		op = await fillAndSign(
+			{
+				callData: erc20TransfercallData.data,
+				sender: account.address,
+				callGasLimit: 2e6,
+				verificationGasLimit: 2e6
+			},
+			accountOwner,
+			entryPoint
+		)
+	}
+
+	// console.log('loop:', testLoop, 'toOwner:', accountOwner.address)
+	return { op, accountOwner, account, accountFactory }
 }

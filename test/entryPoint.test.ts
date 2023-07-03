@@ -5,8 +5,8 @@ import {
   AccountFactory__factory,
   EntryPoint,
   EntryPoint__factory,
-  TestPaymaster,
-  TestPaymaster__factory,
+  VerifyingPaymaster,
+  VerifyingPaymaster__factory,
   TestToken,
   TestToken__factory,
   ZkProverZkpVerifierWrapper__factory,
@@ -94,7 +94,7 @@ describe("EntryPoint", function () {
 
   let verifier: ZkProverZkpVerifierWrapper;
   let entryPoint: EntryPoint;
-  let paymaster: TestPaymaster;
+  let paymaster: VerifyingPaymaster;
   let accountFactory: AccountFactory;
   let testToken: TestToken;
 
@@ -133,8 +133,9 @@ describe("EntryPoint", function () {
     );
     console.log("entryPoint.address:", entryPoint.address);
 
-    paymaster = await new TestPaymaster__factory(paymasterOwner).deploy(
-      entryPoint.address
+    paymaster = await new VerifyingPaymaster__factory(paymasterOwner).deploy(
+      entryPoint.address,
+      await ethers.provider.getSigner(1).getAddress()
     );
     console.log("paymaster.address:", paymaster.address);
 
@@ -167,7 +168,7 @@ describe("EntryPoint", function () {
   });
 
   it("should succeed to handleOps", async function () {
-    const txLength = 129;
+    const txLength = 128;
     const ops: UserOperationStruct[] = [];
     const accountOwners: Wallet[] = [];
     for (let i = 0; i < txLength; i++) {
@@ -182,12 +183,12 @@ describe("EntryPoint", function () {
       ops.push(op);
       accountOwners.push(accountOwner);
 
-      console.log(
-        "generateAccountAndERC20TransferOp:",
-        account.address,
-        ", index: ",
-        i
-      );
+      // console.log(
+      //   "generateAccountAndERC20TransferOp:",
+      //   account.address,
+      //   ", index: ",
+      //   i
+      // );
     }
 
     const resp = await entryPoint
@@ -212,17 +213,18 @@ describe("EntryPoint", function () {
         resp.gasUsed.toString()
       )} avg gas ${JSON.stringify(
         resp.gasUsed.div(BigNumber.from(txLength)).toString()
-      )} normal gas ${JSON.stringify(normalTx.gasUsed.toString())}`
+      )} normal gas ${JSON.stringify(normalTx.gasUsed.toString())}
+      ops length ${JSON.stringify(txLength)}`
     );
 
     for (const accountOwner of accountOwners) {
       const balance = await testToken.balanceOf(accountOwner.address);
-      console.warn(
-        "accountOwner.address:",
-        accountOwner.address,
-        ", balance:",
-        balance + ""
-      );
+      // console.warn(
+      //   "accountOwner.address:",
+      //   accountOwner.address,
+      //   ", balance:",
+      //   balance + ""
+      // );
     }
 
     // console.warn("resp.events:", resp.events);

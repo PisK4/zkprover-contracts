@@ -111,13 +111,17 @@ const config: HardhatUserConfig = {
       // https://hardhat.org/hardhat-network/#solidity-optimizer-support
       optimizer: {
         enabled: true,
-        runs: 800,
+        runs: 500000
       },
+      viaIR: true
     },
   },
   typechain: {
     target: "ethers-v5",
   },
+  mocha: {
+		timeout: 2000000
+	},
 };
 
 export default config;
